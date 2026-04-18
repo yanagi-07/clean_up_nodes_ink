@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape/extension">
+    <name>パスのクリーンアップ</name>
+    <id>org.cutlings.clean_up_path</id>
+    <dependency type="executable" location="inx">clean_up_path.py</dependency>
+    <param name="name" type="notebook">
+        <page name="options" gui-text="オプション">
+            <label xml:space="preserve">
+選択したパスから重複ノードを除去し、近いノード同士を結合してパスを整理します。
+
+            </label>
+            <param name="minUse" type="bool" gui-text="合計長さが指定値未満のセグメントのノードを補間する">false</param>
+                <param name="minlength" indent="4" type="float" precision="2" min="0" max="100" appearance="full" gui-text="最小セグメント長">1.0</param>
+            <param name="minUseSub" type="bool" gui-text="合計長さが指定値未満のサブパスを削除する">false</param>
+                <param name="minlengthSub" indent="4" type="float" precision="2" min="0" max="100" appearance="full" gui-text="最小サブパス長">1.0</param>
+            <param name="closeSub" type="bool" gui-text="始点と終点の距離が指定値未満のサブパスを閉じる">false</param>
+                <param name="maxdistClose" indent="4" type="float" precision="2" min="0" max="100" appearance="full" gui-text="しきい値">1.0</param>
+            <param name="joinEndSub" type="bool" gui-text="距離が指定値未満の別サブパス終端を結合する">false</param>
+                <param name="maxdistJoin" indent="4" type="float" precision="2" min="0" max="100" appearance="full" gui-text="しきい値">1.0</param>
+                <param name="allow_reverse" indent="4" type="bool" gui-text="サブパスの向き反転を許可する">true</param>
+                <param name="option_join" indent="4" type="optiongroup" appearance="radio" gui-text="サブパスの結合方法">
+                    <option value="1">ノードを補間する</option>
+                    <option value="2">直線セグメントを追加する</option>
+                </param>
+            <label xml:space="preserve">
+単位はドキュメント設定（ファイル → ドキュメントのプロパティ）に従います。
+            </label>
+        </page>
+        <page name="help" gui-text="情報">
+            <label xml:space="preserve">
+この拡張は、余分なノードや小さな隙間を除去して、カッターやプロッター向けにパスを整理する目的で作成されました。
+
+完全に重複したノード（座標が完全一致するもの）と、長さが 0 のサブパスは常に削除されます。
+パス同士を結合したい場合は、対象パスがあらかじめ結合済みであることを確認してください（同一パス内のサブパスである必要があります）。
+複数のパスを結合するには、対象を選択して Ctrl+K を押します。
+            </label>
+        </page>
+    </param>
+    <effect>
+        <object-type>path</object-type>
+        <effects-menu>
+            <submenu name="パスの変形"/>
+        </effects-menu>
+    </effect>
+    <script>
+        <command location="inx" interpreter="python">clean_up_path.py</command>
+    </script>
+</inkscape-extension>
