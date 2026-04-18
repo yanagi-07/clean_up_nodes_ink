@@ -1,1 +1,638 @@
+#!/usr/bin/env python3
+"""
+Inkscape extension to collapse duplicate consecutive path nodes into a single
+sharp node.
+"""
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import inkex
+
+from clean_out_nodes_core import (
+    clean_duplicate_nodes_in_subpath,
+    find_duplicate_candidates_in_subpath,
+    normalize_tolerance_level,
+    tolerance_radius_for_level,
+)
+
+
+DEFAULT_TOLERANCE_LEVEL = "medium"
+NON_RENDERING_CONTAINERS = {
+    "clipPath",
+    "defs",
+    "marker",
+    "mask",
+    "pattern",
+    "symbol",
+}
+
+PRESET_LABELS = {
+    "weak": "弱",
+    "medium_weak": "中弱",
+    "medium": "中",
+    "medium_strong": "中強",
+    "strong": "強",
+}
+
+NODE_TYPE_LABELS = {
+    "cusp": "カスプ",
+    "smooth": "スムーズ",
+    "symmetric": "対称",
+    "auto": "自動スムーズ",
+    "unknown": "不明",
+}
+
+DIAGNOSTIC_GROUP_ATTR = "data-clean-out-nodes-overlay"
+DIAGNOSTIC_GROUP_VALUE = "duplicate-markers"
+
+
+@dataclass
+class CleanupStats:
+    processed_paths: int = 0
+    total_nodes: int = 0
+    changed_paths: int = 0
+    removed_nodes: int = 0
+    deleted_paths: int = 0
+    dropped_subpaths: int = 0
+    skipped_locked: int = 0
+    skipped_non_rendering: int = 0
+    duplicate_candidate_pairs: int = 0
+    duplicate_candidate_nodes: int = 0
+    highlighted_nodes: int = 0
+    reselected_paths: int = 0
+    node_types: "NodeTypeStats" = field(default_factory=lambda: NodeTypeStats())
+
+
+@dataclass
+class NodeTypeStats:
+    cusp: int = 0
+    smooth: int = 0
+    symmetric: int = 0
+    auto: int = 0
+    unknown: int = 0
+
+    def add(self, node_type: str):
+        if node_type == "cusp":
+            self.cusp += 1
+        elif node_type == "smooth":
+            self.smooth += 1
+        elif node_type == "symmetric":
+            self.symmetric += 1
+        elif node_type == "auto":
+            self.auto += 1
+        else:
+            self.unknown += 1
+
+
+@dataclass(frozen=True)
+class HighlightMarker:
+    element: inkex.PathElement
+    x: float
+    y: float
+
+
+@dataclass(frozen=True)
+class ResolvedToleranceSettings:
+    tolerance_level: str
+    tolerance_radius_px: float
+    effective_tolerance: float
+
+
+class CleanOutNodes(inkex.EffectExtension):
+    def add_arguments(self, pars):
+        pars.add_argument("--operation_mode", default="clean")
+        pars.add_argument("--tolerance_level", default=DEFAULT_TOLERANCE_LEVEL)
+        pars.add_argument(
+            "--include_non_rendering", type=inkex.Boolean, default=False
+        )
+        pars.add_argument("--include_locked", type=inkex.Boolean, default=False)
+        pars.add_argument(
+            "--remove_single_node_subpaths", type=inkex.Boolean, default=False
+        )
+        pars.add_argument(
+            "--highlight_duplicates", type=inkex.Boolean, default=True
+        )
+        pars.add_argument(
+            "--reselect_changed_paths", type=inkex.Boolean, default=True
+        )
+
+    def effect(self):
+        settings = self._resolve_tolerance_settings()
+        paths, stats = self._collect_target_paths()
+        if not paths:
+            raise inkex.AbortExtension(self._build_empty_target_message(stats))
+
+        mode = getattr(self.options, "operation_mode", "clean")
+        stats.processed_paths = len(paths)
+        markers = self._analyze_paths(paths, settings.effective_tolerance, stats)
+        if self.options.highlight_duplicates or mode == "check":
+            self._remove_diagnostic_markers()
+        if self.options.highlight_duplicates and markers:
+            stats.highlighted_nodes = self._render_duplicate_markers(
+                markers, settings.effective_tolerance
+            )
+
+        if mode == "check":
+            if self.options.reselect_changed_paths:
+                try:
+                    self.svg.selection.set(*paths)
+                    stats.reselected_paths = len(paths)
+                except AttributeError:
+                    stats.reselected_paths = 0
+            self.msg(self._build_user_message(stats, settings, mode))
+            inkex.utils.debug(self._build_summary(stats, settings, mode))
+            return
+
+        changed_elements = []
+        for element in paths:
+            result = self._clean_path_element(element, settings.effective_tolerance)
+            if (
+                result["removed_nodes"]
+                or result["deleted_path"]
+                or result["dropped_subpaths"]
+            ):
+                stats.changed_paths += 1
+                if self.options.reselect_changed_paths and not result["deleted_path"]:
+                    changed_elements.append(element)
+
+            stats.removed_nodes += result["removed_nodes"]
+            stats.deleted_paths += int(result["deleted_path"])
+            stats.dropped_subpaths += result["dropped_subpaths"]
+
+        if self.options.reselect_changed_paths and changed_elements:
+            try:
+                self.svg.selection.set(*changed_elements)
+                stats.reselected_paths = len(changed_elements)
+            except AttributeError:
+                stats.reselected_paths = 0
+
+        self.msg(self._build_user_message(stats, settings, mode))
+        inkex.utils.debug(self._build_summary(stats, settings, mode))
+
+    def _collect_target_paths(self):
+        stats = CleanupStats()
+        filtered = []
+        seen = set()
+
+        for element in self._iter_candidate_paths():
+            marker = (
+                getattr(element, "xml_path", None)
+                or element.get("id")
+                or str(id(element))
+            )
+            if marker in seen:
+                continue
+            seen.add(marker)
+
+            if (
+                not self.options.include_non_rendering
+                and self._inside_non_rendering_container(element)
+            ):
+                stats.skipped_non_rendering += 1
+                continue
+
+            if not self.options.include_locked and not self._is_editable(element):
+                stats.skipped_locked += 1
+                continue
+
+            filtered.append(element)
+
+        return filtered, stats
+
+    def _iter_candidate_paths(self):
+        for element in self.svg.selection.get(inkex.PathElement):
+            yield element
+
+    def _inside_non_rendering_container(self, element: inkex.PathElement) -> bool:
+        for ancestor in element.ancestors():
+            tag_name = getattr(ancestor, "TAG", "")
+            if tag_name in NON_RENDERING_CONTAINERS:
+                return True
+        return False
+
+    def _is_editable(self, element: inkex.PathElement) -> bool:
+        if hasattr(element, "is_sensitive") and not element.is_sensitive():
+            return False
+        for ancestor in element.ancestors():
+            if hasattr(ancestor, "is_sensitive") and not ancestor.is_sensitive():
+                return False
+        return True
+
+    def _clean_path_element(self, element: inkex.PathElement, tolerance: float):
+        superpath = element.path.to_superpath()
+        closed_flags = self._subpath_closed_flags(element, len(superpath))
+        working_subpaths = [
+            self._normalize_subpath_for_analysis(subpath, closed)
+            for subpath, closed in zip(superpath, closed_flags)
+        ]
+        nodetype_subpaths = self._split_nodetype_codes(element, working_subpaths)
+        new_subpaths = []
+        new_nodetypes = []
+        removed_nodes = 0
+        dropped_subpaths = 0
+
+        for subpath, closed, nodetypes in zip(working_subpaths, closed_flags, nodetype_subpaths):
+            transformed_subpath = self._transform_subpath_for_tolerance(
+                element, subpath
+            )
+            result = clean_duplicate_nodes_in_subpath(
+                subpath,
+                tolerance,
+                closed=closed,
+                nodetypes=nodetypes,
+                reference_subpath=transformed_subpath,
+            )
+            removed_nodes += result.removed_nodes
+
+            if self.options.remove_single_node_subpaths and len(result.subpath) < 2:
+                dropped_subpaths += 1
+                continue
+
+            new_subpaths.append(self._serialize_subpath(result.subpath, closed))
+            new_nodetypes.append(result.nodetypes)
+
+        if not removed_nodes and not dropped_subpaths:
+            return {
+                "removed_nodes": 0,
+                "dropped_subpaths": 0,
+                "deleted_path": False,
+            }
+
+        if not new_subpaths:
+            element.delete()
+            return {
+                "removed_nodes": removed_nodes,
+                "dropped_subpaths": dropped_subpaths,
+                "deleted_path": True,
+            }
+
+        element.path = type(superpath)(new_subpaths).to_path()
+        element.set(
+            "{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}nodetypes",
+            "".join(new_nodetypes),
+        )
+        return {
+            "removed_nodes": removed_nodes,
+            "dropped_subpaths": dropped_subpaths,
+            "deleted_path": False,
+        }
+
+    def _analyze_paths(self, paths, tolerance: float, stats: CleanupStats):
+        markers = []
+        for element in paths:
+            path_markers = self._analyze_path_element(element, tolerance, stats)
+            markers.extend(path_markers)
+        return markers
+
+    def _analyze_path_element(
+        self, element: inkex.PathElement, tolerance: float, stats: CleanupStats
+    ):
+        superpath = element.path.to_superpath()
+        transformed_superpath = (
+            element.path.transform(element.composed_transform()).to_superpath()
+        )
+        closed_flags = self._subpath_closed_flags(element, len(superpath))
+        working_subpaths = [
+            self._normalize_subpath_for_analysis(subpath, closed)
+            for subpath, closed in zip(superpath, closed_flags)
+        ]
+        working_transformed_subpaths = [
+            self._normalize_subpath_for_analysis(subpath, closed)
+            for subpath, closed in zip(transformed_superpath, closed_flags)
+        ]
+        nodetype_subpaths = self._split_nodetype_codes(element, working_subpaths)
+        candidate_nodes = set()
+        markers = []
+
+        for subpath_index, (subpath, transformed_subpath, closed, nodetypes) in enumerate(
+            zip(
+                working_subpaths,
+                working_transformed_subpaths,
+                closed_flags,
+                nodetype_subpaths,
+            )
+        ):
+            stats.total_nodes += len(subpath)
+
+            for node, nodetype_code in zip(subpath, nodetypes):
+                node_type = self._classify_node_type(
+                    node,
+                    nodetype_code,
+                )
+                stats.node_types.add(node_type)
+
+            for candidate in find_duplicate_candidates_in_subpath(
+                transformed_subpath,
+                tolerance,
+                closed=closed,
+                all_pairs=False,
+            ):
+                stats.duplicate_candidate_pairs += 1
+                for node_index in (candidate.first_index, candidate.second_index):
+                    marker_key = (id(element), subpath_index, node_index)
+                    if marker_key in candidate_nodes:
+                        continue
+                    candidate_nodes.add(marker_key)
+                    anchor = transformed_subpath[node_index][1]
+                    markers.append(
+                        HighlightMarker(
+                            element=element,
+                            x=float(anchor[0]),
+                            y=float(anchor[1]),
+                        )
+                    )
+
+        stats.duplicate_candidate_nodes += len(candidate_nodes)
+        return markers
+
+    def _resolve_nodetype_codes(self, element: inkex.PathElement):
+        return (
+            element.get("sodipodi:nodetypes")
+            or element.get("{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}nodetypes")
+            or ""
+        )
+
+    def _split_nodetype_codes(self, element: inkex.PathElement, superpath):
+        nodetypes = self._resolve_nodetype_codes(element)
+        offset = 0
+        split_codes = []
+
+        for subpath in superpath:
+            length = len(subpath)
+            chunk = nodetypes[offset : offset + length]
+            if len(chunk) < length:
+                chunk += "c" * (length - len(chunk))
+            split_codes.append(chunk)
+            offset += length
+
+        return split_codes
+
+    def _normalize_subpath_for_analysis(self, subpath, closed: bool):
+        normalized = [self._clone_superpath_node(node) for node in subpath]
+        if (
+            closed
+            and len(normalized) > 1
+            and self._nodes_share_anchor(normalized[0], normalized[-1])
+        ):
+            normalized.pop()
+        return normalized
+
+    def _serialize_subpath(self, subpath, closed: bool):
+        serialized = [self._clone_superpath_node(node) for node in subpath]
+        if closed and serialized:
+            serialized.append(self._clone_superpath_node(serialized[0]))
+        return serialized
+
+    def _clone_superpath_node(self, node):
+        return [[float(point[0]), float(point[1])] for point in node]
+
+    def _nodes_share_anchor(self, first, second):
+        return (
+            abs(float(first[1][0]) - float(second[1][0])) <= 1e-9
+            and abs(float(first[1][1]) - float(second[1][1])) <= 1e-9
+        )
+
+    def _subpath_closed_flags(self, element: inkex.PathElement, expected_count: int):
+        flags = []
+        current_closed = False
+        has_subpath = False
+
+        for command, _params in element.path.to_arrays():
+            letter = command.upper()
+            if letter == "M":
+                if has_subpath:
+                    flags.append(current_closed)
+                has_subpath = True
+                current_closed = False
+            elif letter == "Z":
+                current_closed = True
+
+        if has_subpath:
+            flags.append(current_closed)
+
+        if len(flags) < expected_count:
+            flags.extend([False] * (expected_count - len(flags)))
+        return flags[:expected_count]
+
+    def _classify_node_type(self, node, nodetype_code: str | None):
+        if nodetype_code == "c":
+            return "cusp"
+        if nodetype_code == "s":
+            return "smooth"
+        if nodetype_code == "z":
+            return "symmetric"
+        if nodetype_code == "a":
+            return "auto"
+        return self._infer_node_type_from_handles(node)
+
+    def _infer_node_type_from_handles(self, node):
+        incoming = (
+            float(node[0][0]) - float(node[1][0]),
+            float(node[0][1]) - float(node[1][1]),
+        )
+        outgoing = (
+            float(node[2][0]) - float(node[1][0]),
+            float(node[2][1]) - float(node[1][1]),
+        )
+        incoming_len = (incoming[0] ** 2 + incoming[1] ** 2) ** 0.5
+        outgoing_len = (outgoing[0] ** 2 + outgoing[1] ** 2) ** 0.5
+
+        if incoming_len == 0.0 and outgoing_len == 0.0:
+            return "cusp"
+        if incoming_len == 0.0 or outgoing_len == 0.0:
+            return "unknown"
+
+        cross = incoming[0] * outgoing[1] - incoming[1] * outgoing[0]
+        dot = incoming[0] * outgoing[0] + incoming[1] * outgoing[1]
+        if abs(cross) > 1e-6 or dot > 0:
+            return "cusp"
+
+        if abs(incoming_len - outgoing_len) <= max(incoming_len, outgoing_len) * 0.05:
+            return "symmetric"
+        return "smooth"
+
+    def _remove_diagnostic_markers(self):
+        for element in list(self.svg.descendants()):
+            if element.get(DIAGNOSTIC_GROUP_ATTR) == DIAGNOSTIC_GROUP_VALUE:
+                element.delete()
+
+    def _render_duplicate_markers(self, markers, tolerance: float):
+        exact_radius = max(float(tolerance), 0.0)
+        inner_radius = self.svg.unittouu("3px")
+        stroke_width = self.svg.unittouu("1.5px")
+        container = self.svg.get_current_layer()
+        if container is None:
+            container = self.svg
+        group = container.add(inkex.Group(id=self.svg.get_unique_id("dupmarkers")))
+        group.set(DIAGNOSTIC_GROUP_ATTR, DIAGNOSTIC_GROUP_VALUE)
+        try:
+            group.transform = -container.composed_transform()
+        except AttributeError:
+            pass
+
+        for marker in markers:
+            if exact_radius > 0.0:
+                outer_circle = group.add(
+                    inkex.Circle(
+                        cx=str(marker.x),
+                        cy=str(marker.y),
+                        r=str(exact_radius),
+                    )
+                )
+                outer_circle.style = inkex.Style(
+                    {
+                        "fill": "#ff2b2b",
+                        "fill-opacity": "0.18",
+                        "stroke": "#ffffff",
+                        "stroke-width": str(stroke_width),
+                    }
+                )
+
+            inner_circle = group.add(
+                inkex.Circle(cx=str(marker.x), cy=str(marker.y), r=str(inner_radius))
+            )
+            inner_circle.style = inkex.Style(
+                {
+                    "fill": "#ff2b2b",
+                    "fill-opacity": "0.95",
+                    "stroke": "#ffffff",
+                    "stroke-width": str(self.svg.unittouu("0.8px")),
+                }
+            )
+
+        return len(markers)
+
+    def _resolve_tolerance_settings(self) -> ResolvedToleranceSettings:
+        tolerance_level = normalize_tolerance_level(
+            getattr(self.options, "tolerance_level", DEFAULT_TOLERANCE_LEVEL)
+        )
+        tolerance_radius_px = tolerance_radius_for_level(tolerance_level)
+        effective_tolerance = self.svg.unittouu(f"{tolerance_radius_px}px")
+        return ResolvedToleranceSettings(
+            tolerance_level=tolerance_level,
+            tolerance_radius_px=tolerance_radius_px,
+            effective_tolerance=effective_tolerance,
+        )
+
+    def _transform_subpath_for_tolerance(self, element: inkex.PathElement, subpath):
+        transformed = []
+        composed = element.composed_transform()
+        for node in subpath:
+            transformed.append(
+                [
+                    list(composed.apply_to_point(node[0])),
+                    list(composed.apply_to_point(node[1])),
+                    list(composed.apply_to_point(node[2])),
+                ]
+            )
+        return transformed
+
+    def _build_empty_target_message(self, stats: CleanupStats) -> str:
+        message = "選択中の path が見つかりません。"
+        details = []
+        if stats.skipped_locked:
+            details.append("ロック中の要素を除外しました")
+        if stats.skipped_non_rendering:
+            details.append("defs / marker / clipPath などの内部パスを除外しました")
+
+        if details:
+            message += (
+                " " + "、".join(details) + "。必要なら詳細オプションを変更してください。"
+            )
+
+        return message
+
+    def _build_summary(
+        self, stats: CleanupStats, settings: ResolvedToleranceSettings, mode: str
+    ) -> str:
+        return (
+            "clean_out_nodes [{}]: selected {} path(s), total {} node(s), duplicate pairs {}, "
+            "duplicate nodes {}, updated {} path(s), removed {} duplicate node(s), "
+            "dropped {} degenerate subpath(s), deleted {} empty path(s), "
+            "skipped {} locked path(s), skipped {} non-rendering path(s), "
+            "tolerance level {}, radius {:.0f}px, effective tolerance {:.6g}"
+        ).format(
+            mode,
+            stats.processed_paths,
+            stats.total_nodes,
+            stats.duplicate_candidate_pairs,
+            stats.duplicate_candidate_nodes,
+            stats.changed_paths,
+            stats.removed_nodes,
+            stats.dropped_subpaths,
+            stats.deleted_paths,
+            stats.skipped_locked,
+            stats.skipped_non_rendering,
+            settings.tolerance_level,
+            settings.tolerance_radius_px,
+            settings.effective_tolerance,
+        )
+
+    def _build_user_message(
+        self, stats: CleanupStats, settings: ResolvedToleranceSettings, mode: str
+    ) -> str:
+        lines = [
+            "重複ノードのチェックが完了しました。"
+            if mode == "check"
+            else "重複ノードの整理が完了しました。",
+            "対象: 選択したパス",
+            "実行内容: {}".format("チェックのみ" if mode == "check" else "整理する"),
+            "判定許容差: {}".format(PRESET_LABELS[settings.tolerance_level]),
+            "判定半径: {:.0f}px 相当".format(settings.tolerance_radius_px),
+            "実効許容差: {:.6g}".format(settings.effective_tolerance),
+            "選択パス数: {}".format(stats.processed_paths),
+            "選択パス内のノード数: {}".format(stats.total_nodes),
+            "ノード種類: {} {} / {} {} / {} {} / {} {} / {} {}".format(
+                NODE_TYPE_LABELS["cusp"],
+                stats.node_types.cusp,
+                NODE_TYPE_LABELS["smooth"],
+                stats.node_types.smooth,
+                NODE_TYPE_LABELS["symmetric"],
+                stats.node_types.symmetric,
+                NODE_TYPE_LABELS["auto"],
+                stats.node_types.auto,
+                NODE_TYPE_LABELS["unknown"],
+                stats.node_types.unknown,
+            ),
+            "重複候補ペア数: {}".format(stats.duplicate_candidate_pairs),
+            "重複候補ノード数: {}".format(stats.duplicate_candidate_nodes),
+        ]
+
+        if stats.highlighted_nodes:
+            lines.append("赤マーカー表示数: {}".format(stats.highlighted_nodes))
+            lines.append("赤い外側リング半径: 判定半径と同じ")
+        if not stats.duplicate_candidate_pairs:
+            lines.append("現在の許容差では、重複候補は見つかりませんでした。")
+        elif mode != "check" and not stats.removed_nodes:
+            lines.append(
+                "近接ノード候補は見つかりましたが、連続ノードではないため今回は整理対象外でした。"
+            )
+        if mode != "check":
+            lines.append("更新したパス数: {}".format(stats.changed_paths))
+            lines.append("削除した重複ノード数: {}".format(stats.removed_nodes))
+        if stats.dropped_subpaths:
+            lines.append(
+                "削除した1点サブパス数: {}".format(stats.dropped_subpaths)
+            )
+        if stats.deleted_paths:
+            lines.append("削除した空パス数: {}".format(stats.deleted_paths))
+        if stats.skipped_locked:
+            lines.append(
+                "除外したロック中パス数: {}".format(stats.skipped_locked)
+            )
+        if stats.skipped_non_rendering:
+            lines.append(
+                "除外した内部定義パス数: {}".format(stats.skipped_non_rendering)
+            )
+        if stats.reselected_paths:
+            lines.append(
+                "再選択した更新パス数: {}".format(stats.reselected_paths)
+            )
+
+        return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    CleanOutNodes().run()
