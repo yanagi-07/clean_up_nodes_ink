@@ -46,6 +46,7 @@ NODE_TYPE_LABELS = {
 
 DIAGNOSTIC_GROUP_ATTR = "data-clean-up-nodes-ink-overlay"
 DIAGNOSTIC_GROUP_VALUE = "duplicate-markers"
+ZERO_LENGTH_EPSILON = 1e-9
 
 
 @dataclass
@@ -62,6 +63,8 @@ class CleanupStats:
     duplicate_candidate_nodes: int = 0
     highlighted_nodes: int = 0
     reselected_paths: int = 0
+    selection_reset_failures: int = 0
+    skipped_invalid_paths: int = 0
     node_types: "NodeTypeStats" = field(default_factory=lambda: NodeTypeStats())
 
 
@@ -126,7 +129,9 @@ class CleanUpNodesInk(inkex.EffectExtension):
 
         mode = getattr(self.options, "operation_mode", "clean")
         stats.processed_paths = len(paths)
-        markers = self._analyze_paths(paths, settings.effective_tolerance, stats)
+        markers, invalid_path_markers = self._analyze_paths(
+            paths, settings.effective_tolerance, stats
+        )
         if self.options.highlight_duplicates or mode == "check":
             self._remove_diagnostic_markers()
         if self.options.highlight_duplicates and markers:
@@ -136,17 +141,15 @@ class CleanUpNodesInk(inkex.EffectExtension):
 
         if mode == "check":
             if self.options.reselect_changed_paths:
-                try:
-                    self.svg.selection.set(*paths)
-                    stats.reselected_paths = len(paths)
-                except AttributeError:
-                    stats.reselected_paths = 0
+                self._reselect_paths(paths, stats)
             self.msg(self._build_user_message(stats, settings, mode))
             inkex.utils.debug(self._build_summary(stats, settings, mode))
             return
 
         changed_elements = []
         for element in paths:
+            if self._path_marker(element) in invalid_path_markers:
+                continue
             result = self._clean_path_element(element, settings.effective_tolerance)
             if (
                 result["removed_nodes"]
@@ -162,11 +165,7 @@ class CleanUpNodesInk(inkex.EffectExtension):
             stats.dropped_subpaths += result["dropped_subpaths"]
 
         if self.options.reselect_changed_paths and changed_elements:
-            try:
-                self.svg.selection.set(*changed_elements)
-                stats.reselected_paths = len(changed_elements)
-            except AttributeError:
-                stats.reselected_paths = 0
+            self._reselect_paths(changed_elements, stats)
 
         self.msg(self._build_user_message(stats, settings, mode))
         inkex.utils.debug(self._build_summary(stats, settings, mode))
@@ -177,11 +176,7 @@ class CleanUpNodesInk(inkex.EffectExtension):
         seen = set()
 
         for element in self._iter_candidate_paths():
-            marker = (
-                getattr(element, "xml_path", None)
-                or element.get("id")
-                or str(id(element))
-            )
+            marker = self._path_marker(element)
             if marker in seen:
                 continue
             seen.add(marker)
@@ -200,6 +195,44 @@ class CleanUpNodesInk(inkex.EffectExtension):
             filtered.append(element)
 
         return filtered, stats
+
+    def _path_marker(self, element: inkex.PathElement) -> str:
+        return (
+            getattr(element, "xml_path", None)
+            or element.get("id")
+            or str(id(element))
+        )
+
+    def _describe_element(self, element: inkex.PathElement) -> str:
+        element_id = element.get("id")
+        if element_id:
+            return f"path#{element_id}"
+        return f"path@{self._path_marker(element)}"
+
+    def _reselect_paths(self, elements, stats: CleanupStats):
+        try:
+            self.svg.selection.set(*elements)
+            stats.reselected_paths = len(elements)
+        except AttributeError as exc:
+            stats.reselected_paths = 0
+            stats.selection_reset_failures += 1
+            inkex.utils.debug(
+                "clean_up_nodes_ink: failed to reselect {} path(s): {}: {}".format(
+                    len(elements),
+                    type(exc).__name__,
+                    exc,
+                )
+            )
+
+    def _log_invalid_path(self, element: inkex.PathElement, stage: str, exc: Exception):
+        inkex.utils.debug(
+            "clean_up_nodes_ink: skipped invalid path during {} for {}: {}: {}".format(
+                stage,
+                self._describe_element(element),
+                type(exc).__name__,
+                exc,
+            )
+        )
 
     def _iter_candidate_paths(self):
         for element in self.svg.selection.get(inkex.PathElement):
@@ -221,8 +254,17 @@ class CleanUpNodesInk(inkex.EffectExtension):
         return True
 
     def _clean_path_element(self, element: inkex.PathElement, tolerance: float):
-        superpath = element.path.to_superpath()
-        closed_flags = self._subpath_closed_flags(element, len(superpath))
+        try:
+            superpath = element.path.to_superpath()
+            closed_flags = self._subpath_closed_flags(element, len(superpath))
+        except Exception as exc:
+            self._log_invalid_path(element, "cleanup", exc)
+            return {
+                "removed_nodes": 0,
+                "dropped_subpaths": 0,
+                "deleted_path": False,
+                "invalid_path": True,
+            }
         working_subpaths = [
             self._normalize_subpath_for_analysis(subpath, closed)
             for subpath, closed in zip(superpath, closed_flags)
@@ -258,6 +300,7 @@ class CleanUpNodesInk(inkex.EffectExtension):
                 "removed_nodes": 0,
                 "dropped_subpaths": 0,
                 "deleted_path": False,
+                "invalid_path": False,
             }
 
         if not new_subpaths:
@@ -266,6 +309,7 @@ class CleanUpNodesInk(inkex.EffectExtension):
                 "removed_nodes": removed_nodes,
                 "dropped_subpaths": dropped_subpaths,
                 "deleted_path": True,
+                "invalid_path": False,
             }
 
         element.path = type(superpath)(new_subpaths).to_path()
@@ -277,23 +321,35 @@ class CleanUpNodesInk(inkex.EffectExtension):
             "removed_nodes": removed_nodes,
             "dropped_subpaths": dropped_subpaths,
             "deleted_path": False,
+            "invalid_path": False,
         }
 
     def _analyze_paths(self, paths, tolerance: float, stats: CleanupStats):
         markers = []
+        invalid_path_markers = set()
         for element in paths:
-            path_markers = self._analyze_path_element(element, tolerance, stats)
+            path_markers, invalid_path = self._analyze_path_element(
+                element, tolerance, stats
+            )
+            if invalid_path:
+                invalid_path_markers.add(self._path_marker(element))
+                stats.skipped_invalid_paths += 1
+                continue
             markers.extend(path_markers)
-        return markers
+        return markers, invalid_path_markers
 
     def _analyze_path_element(
         self, element: inkex.PathElement, tolerance: float, stats: CleanupStats
     ):
-        superpath = element.path.to_superpath()
-        transformed_superpath = (
-            element.path.transform(element.composed_transform()).to_superpath()
-        )
-        closed_flags = self._subpath_closed_flags(element, len(superpath))
+        try:
+            superpath = element.path.to_superpath()
+            transformed_superpath = (
+                element.path.transform(element.composed_transform()).to_superpath()
+            )
+            closed_flags = self._subpath_closed_flags(element, len(superpath))
+        except Exception as exc:
+            self._log_invalid_path(element, "analysis", exc)
+            return [], True
         working_subpaths = [
             self._normalize_subpath_for_analysis(subpath, closed)
             for subpath, closed in zip(superpath, closed_flags)
@@ -345,14 +401,29 @@ class CleanUpNodesInk(inkex.EffectExtension):
                     )
 
         stats.duplicate_candidate_nodes += len(candidate_nodes)
-        return markers
+        return markers, False
 
     def _resolve_nodetype_codes(self, element: inkex.PathElement):
-        return (
-            element.get("sodipodi:nodetypes")
-            or element.get("{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}nodetypes")
-            or ""
-        )
+        for attribute_name in (
+            "sodipodi:nodetypes",
+            "{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}nodetypes",
+            "nodetypes",
+        ):
+            value = element.get(attribute_name)
+            if value:
+                return value
+
+        for attribute_name, value in getattr(element, "attrib", {}).items():
+            if value and self._is_nodetype_attribute_name(attribute_name):
+                return value
+        return ""
+
+    def _is_nodetype_attribute_name(self, attribute_name: str) -> bool:
+        if attribute_name == "nodetypes" or attribute_name.endswith(":nodetypes"):
+            return True
+        if attribute_name.startswith("{") and "}" in attribute_name:
+            return attribute_name.split("}", 1)[1] == "nodetypes"
+        return False
 
     def _split_nodetype_codes(self, element: inkex.PathElement, superpath):
         nodetypes = self._resolve_nodetype_codes(element)
@@ -439,9 +510,15 @@ class CleanUpNodesInk(inkex.EffectExtension):
         incoming_len = (incoming[0] ** 2 + incoming[1] ** 2) ** 0.5
         outgoing_len = (outgoing[0] ** 2 + outgoing[1] ** 2) ** 0.5
 
-        if incoming_len == 0.0 and outgoing_len == 0.0:
+        if (
+            incoming_len <= ZERO_LENGTH_EPSILON
+            and outgoing_len <= ZERO_LENGTH_EPSILON
+        ):
             return "cusp"
-        if incoming_len == 0.0 or outgoing_len == 0.0:
+        if (
+            incoming_len <= ZERO_LENGTH_EPSILON
+            or outgoing_len <= ZERO_LENGTH_EPSILON
+        ):
             return "unknown"
 
         cross = incoming[0] * outgoing[1] - incoming[1] * outgoing[0]
@@ -536,6 +613,8 @@ class CleanUpNodesInk(inkex.EffectExtension):
             details.append("ロック中の要素を除外しました")
         if stats.skipped_non_rendering:
             details.append("defs / marker / clipPath などの内部パスを除外しました")
+        if stats.skipped_invalid_paths:
+            details.append("破損したパスを除外しました")
 
         if details:
             message += (
@@ -552,6 +631,7 @@ class CleanUpNodesInk(inkex.EffectExtension):
             "duplicate nodes {}, updated {} path(s), removed {} duplicate node(s), "
             "dropped {} degenerate subpath(s), deleted {} empty path(s), "
             "skipped {} locked path(s), skipped {} non-rendering path(s), "
+            "skipped {} invalid path(s), selection reset failures {}, "
             "tolerance level {}, radius {:.0f}px, effective tolerance {:.6g}"
         ).format(
             mode,
@@ -565,6 +645,8 @@ class CleanUpNodesInk(inkex.EffectExtension):
             stats.deleted_paths,
             stats.skipped_locked,
             stats.skipped_non_rendering,
+            stats.skipped_invalid_paths,
+            stats.selection_reset_failures,
             settings.tolerance_level,
             settings.tolerance_radius_px,
             settings.effective_tolerance,
@@ -625,6 +707,14 @@ class CleanUpNodesInk(inkex.EffectExtension):
         if stats.skipped_non_rendering:
             lines.append(
                 "除外した内部定義パス数: {}".format(stats.skipped_non_rendering)
+            )
+        if stats.skipped_invalid_paths:
+            lines.append(
+                "除外した破損パス数: {}".format(stats.skipped_invalid_paths)
+            )
+        if stats.selection_reset_failures:
+            lines.append(
+                "再選択の更新に失敗しました (詳細はデバッグログを確認してください)"
             )
         if stats.reselected_paths:
             lines.append(
