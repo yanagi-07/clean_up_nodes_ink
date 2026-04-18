@@ -688,7 +688,7 @@ class CleanUpNodesInk(inkex.EffectExtension):
 
         if details:
             message += (
-                " " + "、".join(details) + "。必要なら詳細���プションを変更してください。"
+                " " + "、".join(details) + "。必要なら詳細オプションを変更してください。"
             )
 
         return message
