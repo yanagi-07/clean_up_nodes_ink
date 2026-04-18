@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape/extension">
   <name>重複ノードを整理</name>
-  <id>jp.otout.clean_out_nodes</id>
+  <id>jp.otout.clean_up_nodes_ink</id>
 
   <label>重複ノードを検出し、結合して整理します。</label>
 
@@ -72,6 +72,6 @@
   >true</param>
 
   <script>
-    <command location="inx" interpreter="python">clean_out_nodes.py</command>
+    <command location="inx" interpreter="python">clean_up_nodes_ink.py</command>
   </script>
 </inkscape-extension>
