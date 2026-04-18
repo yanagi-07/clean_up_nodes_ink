@@ -1,1 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<inkscape-extension xmlns="http://www.inkscape.org/namespace/inkscape/extension">
+  <name>重複ノードを整理</name>
+  <id>jp.otout.clean_out_nodes</id>
 
+  <label>重複ノードを検出し、結合して整理します。</label>
+
+  <effect>
+    <object-type>all</object-type>
+    <effects-menu>
+      <submenu name="エクスポート"/>
+    </effects-menu>
+  </effect>
+
+  <param
+    name="operation_mode"
+    type="optiongroup"
+    appearance="combo"
+    gui-text="実行内容"
+  >
+    <option value="clean">整理する</option>
+    <option value="check">チェックのみ</option>
+  </param>
+
+  <param
+    name="tolerance_level"
+    type="optiongroup"
+    appearance="combo"
+    gui-text="判定許容差"
+    gui-description="見た目の重なりを基準にした 5 段階です。赤マーカーの外側リング半径もこの設定と同じです。"
+  >
+    <option value="weak">弱</option>
+    <option value="medium_weak">中弱</option>
+    <option value="medium">中</option>
+    <option value="medium_strong">中強</option>
+    <option value="strong">強</option>
+  </param>
+
+  <param
+    name="include_non_rendering"
+    type="bool"
+    gui-text="内部定義のパスも対象にする"
+    gui-description="defs / marker / clipPath / mask / pattern / symbol 内の path も処理します。"
+  >false</param>
+
+  <param
+    name="include_locked"
+    type="bool"
+    gui-text="ロック中の要素も対象にする"
+    gui-description="ロックされたレイヤーや要素の path も処理します。"
+  >false</param>
+
+  <param
+    name="remove_single_node_subpaths"
+    type="bool"
+    gui-text="1点だけになったサブパスを削除する"
+    gui-description="重複整理の結果、1ノードだけ残ったサブパスを取り除きます。"
+  >false</param>
+
+  <param
+    name="highlight_duplicates"
+    type="bool"
+    gui-text="重複候補に赤マーカーを付ける"
+    gui-description="チェック時に、重複候補のノード位置へ赤い補助マーカーを作成します。外側リング半径は実効許容差と同じです。"
+  >true</param>
+
+  <param
+    name="reselect_changed_paths"
+    type="bool"
+    gui-text="統合後ノードを含むパスを再選択する"
+    gui-description="更新された path を再選択します。ノードツールに切り替えると、統合後のノードをすぐ確認できます。"
+  >true</param>
+
+  <script>
+    <command location="inx" interpreter="python">clean_out_nodes.py</command>
+  </script>
+</inkscape-extension>
