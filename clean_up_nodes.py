@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 import inkex
 
-from clean_out_nodes_core import (
+from clean_up_nodes_ink_core import (
     clean_duplicate_nodes_in_subpath,
     find_duplicate_candidates_in_subpath,
     normalize_tolerance_level,
@@ -44,7 +44,7 @@ NODE_TYPE_LABELS = {
     "unknown": "不明",
 }
 
-DIAGNOSTIC_GROUP_ATTR = "data-clean-out-nodes-overlay"
+DIAGNOSTIC_GROUP_ATTR = "data-clean-up-nodes-ink-overlay"
 DIAGNOSTIC_GROUP_VALUE = "duplicate-markers"
 
 
@@ -100,7 +100,7 @@ class ResolvedToleranceSettings:
     effective_tolerance: float
 
 
-class CleanOutNodes(inkex.EffectExtension):
+class CleanUpNodesInk(inkex.EffectExtension):
     def add_arguments(self, pars):
         pars.add_argument("--operation_mode", default="clean")
         pars.add_argument("--tolerance_level", default=DEFAULT_TOLERANCE_LEVEL)
@@ -548,7 +548,7 @@ class CleanOutNodes(inkex.EffectExtension):
         self, stats: CleanupStats, settings: ResolvedToleranceSettings, mode: str
     ) -> str:
         return (
-            "clean_out_nodes [{}]: selected {} path(s), total {} node(s), duplicate pairs {}, "
+            "clean_up_nodes_ink [{}]: selected {} path(s), total {} node(s), duplicate pairs {}, "
             "duplicate nodes {}, updated {} path(s), removed {} duplicate node(s), "
             "dropped {} degenerate subpath(s), deleted {} empty path(s), "
             "skipped {} locked path(s), skipped {} non-rendering path(s), "
@@ -635,4 +635,4 @@ class CleanOutNodes(inkex.EffectExtension):
 
 
 if __name__ == "__main__":
-    CleanOutNodes().run()
+    CleanUpNodesInk().run()
